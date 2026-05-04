@@ -1,0 +1,134 @@
+************************************************************************
+* RATS CODE: BOOTSTRAPPING PERMUTED PANELS (PVWW STANDARD PROCEDURE)   *
+* FIXED: SR10 Missing Values Error & Memory Optimization               *
+* Adapted from Pedroni, Vogelsang, Wagner, and Westerlund (2015)       *
+* By Duncan DeProfio, Williams College ECON 471, 2026                  *
+* This code was generated using Google Gemini AI                       *
+************************************************************************
+env clear
+scratch(all)
+
+* --- USER INPUTS ---
+compute Nsecs = 12           ;* 1 country from each of the 12 tiers
+compute Tperiods = 34        ;* 1990 to 2023
+compute numperms = 1000      ;* Total number of bootstrap panels
+
+compute total_obs = numperms * Nsecs * Tperiods
+all total_obs
+
+* 1. READ DATA DIRECTLY (Asking explicitly for FGasPM ensures it doesn't fail silently)
+open data "fgas_permutations_1000.csv"
+data(format=csv, org=obs) 1 total_obs FGasPM
+close data
+
+compute heterotrends = 'no'
+compute P = 9, m = 0
+compute Tdum = 0
+
+* 2. DECLARE ALL VARIABLES OUTSIDE THE LOOP 
+* (This stops RATS from wiping memory 1000 times)
+dec vect[series] yvec(Nsecs) muhat(Nsecs) mutilde(Nsecs) Stilde(Nsecs) trendvec(P-1)
+dec vec[integer] perm_ranks(numperms)
+dec vec[real] boot_Z1vec(12) boot_d1vec(12) boot_smallcrits(5)
+dec vec boot_crit_vector(Nsecs)
+
+compute boot_smallcrits = ||101.56031,323.89602,751.72488,1393.16502,2261.66016||
+compute boot_d1vec = ||169037.15804,-375970.47567,236742.44174,-28714.71985,462.26011,5.07971,$
+                  12978.51792,-800.55043,-531706.18433,34932714.04854,-7336758.89483,286553.86002||
+
+* 3. BUILD THE TREND VECTOR ONCE
+set trend 1 Tperiods = T
+do j=1,(P-1)
+   set trendvec(j) 1 Tperiods = trend(T)**(j+1)
+end do j
+
+* ----------------------------------------------------------------------
+* BEGIN BOOTSTRAP LOOP
+* ----------------------------------------------------------------------
+do p = 1, numperms
+
+   * Calculate where this specific panel starts in the dataset
+   compute panel_start = (p-1) * Nsecs * Tperiods
+
+   * Load the 12 countries for THIS specific permutation directly from FGasPM
+   * Note: Using capital 'T' ensures RATS uses its internal time-step index
+   do j=1,Nsecs
+      set yvec(j) 1 Tperiods = FGasPM(panel_start + (j-1)*Tperiods + T)
+   end do j
+
+   * Run regressions
+   do i=1,Nsecs
+      linreg(noprint) yvec(i) 1 Tperiods muhat(i)
+      # constant trendvec
+      
+      linreg(noprint) yvec(i) 1 Tperiods mutilde(i)
+      # constant
+      
+      if heterotrends == 'yes' {
+         linreg(noprint) yvec(i) 1 Tperiods mutilde(i)
+         # constant trend
+      }
+      accumulate mutilde(i) 1 Tperiods Stilde(i)
+   end do i
+
+   MAKE Uhatmat 1 Tperiods numobs Nsecs
+   # muhat(1) to muhat(Nsecs)
+   MAKE Umat 1 Tperiods numobs Nsecs
+   # mutilde(1) to mutilde(Nsecs)
+   MAKE Smat 1 Tperiods numobs Nsecs
+   # Stilde(1) to Stilde(Nsecs)
+
+   * Original Matrix Inversion
+   compute MMIBmatrix = tr(Umat)*Umat*inv(tr(Smat)*Smat)*Tperiods/2.0
+   eigen MMIBmatrix lambdavec
+
+   set lambdavals 1 Nsecs = lambdavec(T)
+   order lambdavals 1 Nsecs
+   accum lambdavals 1 Nsecs lambdasums
+   set MMIBvals 1 Nsecs = 2.0*Tperiods*lambdasums
+
+   * Critical Values Block
+   do c=1,5
+      compute boot_crit_vector(c) = boot_smallcrits(c)
+   end do c
+
+   do c=6,Nsecs
+      compute boot_Z1vec = ||1.0, c**0.25, c**0.5, c,c**2, c**3, c**2/float(Tperiods), c**3/float(Tperiods), $
+                        Tperiods**(-1.0), Tperiods**(-2.0), c*Tperiods**(-2.0), c**2*Tperiods**(-2.0)||
+      compute temp_calc_crit = tr(boot_d1vec)*boot_Z1vec
+      compute boot_crit_vector(c) = temp_calc_crit(1,1)
+   end do c
+
+   * Step-Down Sequential Test
+   compute rankest = 0
+   do c=Nsecs,1,-1
+      if MMIBvals(c) < boot_crit_vector(c) {
+         compute rankest = c
+         break
+      }
+   end do c
+
+   * Store the result
+   compute perm_ranks(p) = rankest
+
+end do p
+
+* ========================================================
+* SUMMARY OF BOOTSTRAP RESULTS
+* ========================================================
+display " "
+display "=================================================="
+display "Bootstrap Completed for " numperms " Permutations"
+display "Distribution of Estimated Ranks (N=" Nsecs ", T=" Tperiods "):"
+display "=================================================="
+
+set boot_rank_series 1 numperms = perm_ranks(T)
+
+ext(noprint) boot_rank_series
+statistics(fract) boot_rank_series
+
+
+
+
+
+
