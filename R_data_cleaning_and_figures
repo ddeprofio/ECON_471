@@ -1,0 +1,212 @@
+# Data cleaning: F-gas Emissions per Capita time series panel
+# Duncan DeProfio, 3 May 2026
+# Williams College, Prof. Pedroni, ECON 471
+# This code was generated using Google Gemini AI
+
+library(tidyverse)
+library(writexl)
+library(sf)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(viridis)
+
+# ==========================================
+# 1. Process the F-Gas Emissions Data
+# ==========================================
+emissions_raw <- read_csv("/Users/duncandeprofio/Desktop/ECON_471/FGas_historical_emissions.csv")
+
+fgas_data <- emissions_raw %>%
+  filter(Gas == "F-Gas") %>%
+  filter(!(Country %in% c("World", "European Union (27)")))
+
+year_cols <- grep("^[0-9]{4}$", names(fgas_data), value = TRUE)
+
+fgas_long <- fgas_data %>%
+  pivot_longer(
+    cols = all_of(year_cols),
+    names_to = "Year",
+    values_to = "F-Gas Emissions"
+  ) %>%
+  mutate(Year = as.numeric(Year)) %>%
+  arrange(Country, Year)
+
+fgas_filtered <- fgas_long %>%
+  group_by(Country) %>%
+  filter(!all(`F-Gas Emissions` %in% c(0, 0.0, 0.01))) %>%
+  ungroup()
+
+# ==========================================
+# 2. Process the Population Data (FIXED GHOST DATA)
+# ==========================================
+pop_raw <- read_csv("/Users/duncandeprofio/Desktop/ECON_471/Country_Population.csv", skip = 4)
+
+pop_year_cols <- grep("^[0-9]{4}$", names(pop_raw), value = TRUE)
+
+pop_long <- pop_raw %>%
+  pivot_longer(
+    cols = all_of(pop_year_cols),
+    names_to = "Year",
+    values_to = "Population"
+  ) %>%
+  mutate(Year = as.numeric(Year)) %>%
+  select(`Country Code`, Year, Population) %>%
+  # NEW: Force exactly one population value per country per year
+  distinct(`Country Code`, Year, .keep_all = TRUE) 
+
+# ==========================================
+# 3. Process the GDP Data (FIXED GHOST DATA)
+# ==========================================
+gdp_raw <- read_csv("/Users/duncandeprofio/Desktop/ECON_471/GDP_percap.csv", skip = 4)
+
+gdp_1990 <- gdp_raw %>%
+  select(`Country Name`, `Country Code`, `1990`) %>%
+  rename(GDP_1990 = `1990`) %>%
+  filter(!is.na(GDP_1990)) %>%
+  # NEW: Ensure ISO codes don't duplicate due to territories
+  distinct(`Country Code`, .keep_all = TRUE)
+
+# ==========================================
+# 4. Merge and Calculate (FIXED GHOST DATA)
+# ==========================================
+final_data <- fgas_filtered %>%
+  left_join(pop_long, by = c("ISO" = "Country Code", "Year" = "Year")) %>%
+  inner_join(gdp_1990, by = c("ISO" = "Country Code")) %>%
+  # NEW: Final absolute protection against row duplication
+  distinct(ISO, Year, .keep_all = TRUE) %>% 
+  select(-`Country Name`) %>%
+  mutate(`F-Gas Emissions per million` = `F-Gas Emissions` / (Population / 1000000))
+
+write_xlsx(final_data, "/Users/duncandeprofio/Desktop/ECON_471/fgas_all.xlsx")
+
+# ==========================================
+# 5. Define 12 Tiers based on 1990 GDP
+# ==========================================
+country_tiers <- final_data %>%
+  select(Country, ISO, GDP_1990) %>%
+  distinct() %>%
+  arrange(desc(GDP_1990)) %>%
+  mutate(Tier = ntile(desc(GDP_1990), 12)) %>%
+  group_by(Tier) %>%
+  mutate(CountryID = row_number()) %>%
+  ungroup()
+
+final_data_tiered <- final_data %>%
+  left_join(country_tiers %>% select(ISO, Tier, CountryID), by = "ISO") %>%
+  select(Tier, CountryID, Year, `F-Gas Emissions`, Population, `F-Gas Emissions per million`) %>%
+  rename(
+    FGas = `F-Gas Emissions`,
+    Pop = Population,
+    FGasPM = `F-Gas Emissions per million` 
+  ) %>%
+  arrange(Tier, CountryID, Year)
+
+# ==========================================
+# 6. Output Tiered Datasets (1 to 12)
+# ==========================================
+for (i in 1:12) {
+  tier_data <- final_data_tiered %>%
+    filter(Tier == i) %>%
+    select(-Tier)
+  
+  write_xlsx(tier_data, paste0("/Users/duncandeprofio/Desktop/ECON_471/fgas_tier", i, ".xlsx"))
+}
+
+# ==========================================
+# 7. Execute Stratified Monte Carlo Sampling
+# ==========================================
+num_permutations <- 1000 
+set.seed(6767)
+
+permutation_list <- vector("list", num_permutations)
+
+for (p in 1:num_permutations) {
+  sampled_countries <- final_data_tiered %>%
+    select(Tier, CountryID) %>%
+    distinct() %>%
+    group_by(Tier) %>%
+    slice_sample(n = 1) %>%
+    ungroup()
+  
+  synthetic_panel <- final_data_tiered %>%
+    inner_join(sampled_countries, by = c("Tier", "CountryID")) %>%
+    mutate(
+      Panel_ID = p,
+      CrossSection_ID = Tier 
+    ) %>%
+    select(Panel_ID, CrossSection_ID, Year, FGas, Pop, FGasPM) %>%
+    arrange(Panel_ID, CrossSection_ID, Year)
+  
+  permutation_list[[p]] <- synthetic_panel
+}
+
+all_permutations <- bind_rows(permutation_list)
+write_csv(all_permutations, "/Users/duncandeprofio/Desktop/ECON_471/fgas_permutations_1000.csv")
+
+# ==========================================
+# 8. Generate and Export Spatial Maps (FIXED FRANCE BUG)
+# ==========================================
+world_map <- ne_countries(scale = "medium", returnclass = "sf") %>%
+  filter(admin != "Antarctica") %>%
+  # FIX: Correct the rnaturalearth "-99" ISO bug for France and Norway
+  mutate(iso_a3 = case_when(
+    admin == "France" ~ "FRA",
+    admin == "Norway" ~ "NOR",
+    TRUE ~ iso_a3
+  ))
+
+map_data_tiers <- country_tiers %>%
+  mutate(Tier = as.factor(Tier))
+
+world_data <- world_map %>%
+  left_join(map_data_tiers, by = c("iso_a3" = "ISO"))
+
+base_text_theme <- theme(
+  plot.title = element_text(hjust = 0.5, face = "bold", size = 22),
+  plot.caption = element_text(size = 14, face = "italic"),
+  legend.title = element_text(face = "bold", size = 16),
+  legend.text = element_text(size = 14),
+  legend.position = "bottom"
+)
+
+# 8A. Consolidated Map
+combined_map <- ggplot(data = world_data) +
+  geom_sf(aes(fill = Tier), color = "black", linewidth = 0.1) +
+  scale_fill_viridis(
+    discrete = TRUE, 
+    option = "plasma", 
+    direction = -1, 
+    na.value = "#E0E0E0", 
+    name = "Income Tier\n(1=Richest, 12=Poorest)"
+  ) +
+  labs(
+    title = "Global Income Tiers Based on 1990 GDP per Capita",
+    caption = "Grey denotes missing data or excluded cross-sections"
+  ) +
+  theme_void() +
+  base_text_theme
+
+ggsave("/Users/duncandeprofio/Desktop/ECON_471/Income_Tiers_Combined_Map.png", 
+       plot = combined_map, width = 12, height = 7, dpi = 300)
+
+# 8B. Iterative Isolated Maps
+for (i in 1:12) {
+  world_data_isolated <- world_data %>%
+    mutate(Highlight = ifelse(!is.na(Tier) & Tier == i, paste("Tier", i), "Other/Missing"))
+  
+  single_map <- ggplot(data = world_data_isolated) +
+    geom_sf(aes(fill = Highlight), color = "black", linewidth = 0.1) +
+    scale_fill_manual(
+      values = setNames(c("#B30000", "#E0E0E0"), c(paste("Tier", i), "Other/Missing")),
+      name = ""
+    ) +
+    labs(
+      title = paste("Income Tier", i, "Isolation (1990 GDP Base)"),
+      caption = "Grey denotes missing data, excluded cross-sections, or other tiers"
+    ) +
+    theme_void() +
+    base_text_theme
+  
+  ggsave(paste0("/Users/duncandeprofio/Desktop/ECON_471/Income_Tier_", i, "_Isolated_Map.png"), 
+         plot = single_map, width = 12, height = 7, dpi = 300)
+}
+
